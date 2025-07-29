@@ -1,0 +1,242 @@
+import numpy as np
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler, OrdinalEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.svm import SVC # Specific model for this file (SVC - Support Vector Classifier)
+from typing import List, Optional, Any, Dict
+
+# Import common tools and the state class from shared_tools
+from shared_tools import (
+    MLWorkflowState, load_data, preprocess_data, select_imputer,
+    select_scaler, evaluate_classification_model, _engineer_features, # CHANGED: Use evaluate_classification_model
+    llm, FeatureEngineeringPrompt, train_model
+)
+
+# --- Specific Tool Functions for SVC Classification ---
+
+def build_svc_pipeline(ml_state: MLWorkflowState,
+                       numeric_imputer_params: Dict[str, Any],
+                       categorical_imputer_params: Dict[str, Any],
+                       numeric_scaler_params: Dict[str, Any],
+                       categorical_encoder_params: Dict[str, Any],
+                       model_params: Dict[str, Any]) -> None:
+    """
+    Tool to build a scikit-learn preprocessing and Support Vector Classifier (SVC) model pipeline.
+    Constructs objects from parameters and stores the pipeline in MLWorkflowState.
+    """
+    # Instantiate imputers
+    if numeric_imputer_params["type"] == "simple":
+        numeric_imputer = SimpleImputer(strategy=numeric_imputer_params["strategy"])
+    elif numeric_imputer_params["type"] == "knn":
+        numeric_imputer = KNNImputer()
+    else:
+        raise ValueError(f"Unknown numeric imputer type: {numeric_imputer_params['type']}")
+
+    if categorical_imputer_params["type"] == "simple":
+        if categorical_imputer_params["strategy"] == "constant":
+            categorical_imputer = SimpleImputer(strategy="constant", fill_value="missing")
+        else: # 'most_frequent'
+            categorical_imputer = SimpleImputer(strategy=categorical_imputer_params["strategy"])
+    elif categorical_imputer_params["type"] == "constant":
+        categorical_imputer = SimpleImputer(strategy="constant", fill_value="missing")
+    else:
+        raise ValueError(f"Unknown categorical imputer type: {categorical_imputer_params['type']}")
+
+    # Instantiate scalers/encoders
+    # SVC is sensitive to feature scaling, so 'none' is generally not recommended here.
+    if numeric_scaler_params["type"] == "standard":
+        numeric_scaler_obj = StandardScaler()
+    elif numeric_scaler_params["type"] == "minmax":
+        numeric_scaler_obj = MinMaxScaler()
+    elif numeric_scaler_params["type"] == "none":
+        numeric_scaler_obj = 'passthrough' # Allow 'none' but it's often not optimal for SVC
+    else:
+        raise ValueError(f"Unknown numeric scaler type: {numeric_scaler_params['type']}")
+
+    if categorical_encoder_params["type"] == "onehot":
+        categorical_encoder_obj = OneHotEncoder(handle_unknown="ignore")
+    elif categorical_encoder_params["type"] == "ordinal":
+        categorical_encoder_obj = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+    else:
+        raise ValueError(f"Unknown categorical encoder type: {categorical_encoder_params['type']}")
+
+    # Create numeric pipeline steps, handling the 'none' scaler case
+    numeric_pipeline_steps = [("imputer", numeric_imputer)]
+    if numeric_scaler_obj != 'passthrough':
+        numeric_pipeline_steps.append(("scaler", numeric_scaler_obj))
+    numeric_pipeline = Pipeline(numeric_pipeline_steps)
+
+    categorical_pipeline = Pipeline([
+        ("imputer", categorical_imputer),
+        ("encoder", categorical_encoder_obj)
+    ])
+
+    preprocessor = ColumnTransformer(
+        [
+            ("num", numeric_pipeline, ml_state.numeric_cols),
+            ("cat", categorical_pipeline, ml_state.categorical_cols)
+        ],
+        remainder='passthrough'
+    )
+
+    # Instantiate the Support Vector Classifier model with specified parameters
+    # Set probability=True if ROC AUC is desired, but it can make fitting slower.
+    # We'll add it to model_params if the user requests it or if it's a default.
+    svc_model = SVC(**model_params)
+
+    pipeline = Pipeline([
+        ("preprocessing", preprocessor),
+        ("model", svc_model)
+    ])
+    
+    ml_state.pipeline = pipeline # Store the pipeline in the state
+
+    print(f"Pipeline with SVC built and stored with key: {ml_state.pipeline_key}")
+    print(f"Model Parameters: {model_params}")
+
+
+# --- Orchestrator Tool: run_svc_workflow ---
+def run_svc_workflow(
+    path: str,
+    target_column: str,
+    user_query : Optional[str] = None,
+    ignore_columns: Optional[List[str]] = None,
+    numeric_imputer_type: str = "simple",
+    numeric_imputer_strategy: str = "mean",
+    categorical_imputer_type: str = "simple",
+    categorical_imputer_strategy: str = "constant",
+    numeric_scaler_type: str = "standard", # Default to 'standard' for SVC as it's scale-sensitive
+    categorical_encoder_type: str = "onehot",
+    # --- SVC Hyperparameters ---
+    svc_kernel: str = 'rbf',
+    svc_C: float = 1.0,
+    svc_gamma: str = 'scale',
+    svc_probability: bool = False, # Added for ROC AUC calculation if needed
+    svc_class_weight: Optional[Dict[Any, float]] = None,
+) -> Dict[str, Any]: # Return a dictionary for the agent's observable output
+    """
+    A comprehensive tool to orchestrate an end-to-end Support Vector Classifier (SVC) workflow.
+    """
+    # Initialize the MLWorkflowState object inside the workflow tool
+    ml_state = MLWorkflowState() # Create a fresh MLWorkflowState for this run
+
+    # Store initial parameters in ml_state for comprehensive summary at the end
+    ml_state.workflow_summary.update({
+        "path": path, "target_column": target_column, "ignore_columns": ignore_columns,
+        "numeric_imputer_type": numeric_imputer_type, "numeric_imputer_strategy": numeric_imputer_strategy,
+        "categorical_imputer_type": categorical_imputer_type, "categorical_imputer_strategy": categorical_imputer_strategy,
+        "numeric_scaler_type": numeric_scaler_type, "categorical_encoder_type": categorical_encoder_type,
+        "model_hyperparameters": {
+            "kernel": svc_kernel,
+            "C": svc_C,
+            "gamma": svc_gamma,
+            "probability": svc_probability, # Pass probability param
+            "class_weight": svc_class_weight,
+            "random_state": 42 # for reproducibility
+        }
+    })
+    ml_state.workflow_summary["status"] = "started"
+
+    print(f"Starting SVC workflow for {path} with target '{target_column}'...")
+
+
+    try:
+        # Step 1: Load Data
+        print("\n--- Step 1: Loading Data ---")
+        load_data(ml_state, path=path)
+        ml_state.workflow_summary["steps_completed"].append("Data Loaded")
+        
+        # Step 2: Preprocess Data
+        print("\n--- Step 2: Preprocessing Data ---")
+        preprocess_data(
+            ml_state, target_column,
+            ignore_cols=ignore_columns 
+        )
+        ml_state.workflow_summary["steps_completed"].append("Data Preprocessed")
+        ml_state.workflow_summary["numeric_columns"] = ml_state.numeric_cols
+        ml_state.workflow_summary["categorical_columns"] = ml_state.categorical_cols
+        ml_state.workflow_summary["target_column"] = ml_state.target_column
+
+        print("\n--- Step 2.5: Checking for Feature Engineering Request ---")
+        extractor = llm.with_structured_output(FeatureEngineeringPrompt)
+        print("User Query:",user_query)
+        extraction_prompt_text = (
+            "From the following user query, extract the specific instruction for "
+            "creating new features. If no such instruction exists, return null.\n\n"
+            f"USER QUERY: '{user_query}'"
+        )
+        extracted_prompt = extractor.invoke(extraction_prompt_text).prompt
+        ml_state.feature_engineering_prompt = extracted_prompt
+        print("extracted prompt:",extracted_prompt)
+        
+        if extracted_prompt:
+            print(f"Found feature engineering instruction: '{extracted_prompt}'")
+            _engineer_features(
+                ml_state, user_prompt=extracted_prompt
+            )
+            ml_state.workflow_summary["steps_completed"].append("Feature Engineering")
+            ml_state.workflow_summary["newly_added_columns"] = ml_state.newly_added_columns
+        else:
+            print("No feature engineering request found in the query.")
+            pass
+
+        # NOTE: Correlation drop step is typically skipped for SVC.
+        print("\n--- Skipping Correlation Drop (not typically necessary for SVC) ---")
+
+        # Step 4: Select Imputers
+        print("\n--- Step 4: Selecting Imputers ---")
+        select_imputer(
+            ml_state,
+            numeric_type=numeric_imputer_type, categorical_type=categorical_imputer_type,
+            numeric_strategy=numeric_imputer_strategy, categorical_strategy=categorical_imputer_strategy
+        )
+        ml_state.workflow_summary["steps_completed"].append("Imputers Selected")
+
+        # Step 5: Select Scaler and Encoder
+        print("\n--- Step 5: Selecting Scaler and Encoder ---")
+        select_scaler(
+            ml_state,
+            numeric_scaler=numeric_scaler_type, categorical_encoder=categorical_encoder_type
+        )
+        ml_state.workflow_summary["steps_completed"].append("Scaler and Encoder Selected")
+
+        # Step 6: Build Pipeline
+        print("\n--- Step 6: Building Pipeline ---")
+        build_svc_pipeline( # Call the specific pipeline builder
+            ml_state,
+            numeric_imputer_params={"type": ml_state.numeric_imputer_type, "strategy": ml_state.numeric_imputer_strategy},
+            categorical_imputer_params={"type": ml_state.categorical_imputer_type, "strategy": ml_state.categorical_imputer_strategy},
+            numeric_scaler_params={"type": ml_state.numeric_scaler_type},
+            categorical_encoder_params={"type": ml_state.categorical_encoder_type},
+            model_params=ml_state.workflow_summary["model_hyperparameters"]
+        )
+        ml_state.workflow_summary["steps_completed"].append("Pipeline Built")
+
+        # Step 7: Train Model
+        print("\n--- Step 7: Training Model ---")
+        train_model(ml_state, apply_log_transform=False) # No log transform for SVC target
+        ml_state.workflow_summary["steps_completed"].append("Model Trained")
+
+        # Step 8: Evaluate Model
+        print("\n--- Step 8: Evaluating Model ---")
+        evaluate_classification_model(ml_state) # CHANGED: Use classification evaluation
+        ml_state.workflow_summary["steps_completed"].append("Model Evaluated")
+        ml_state.workflow_summary["evaluation_metrics"] = ml_state.evaluation_metrics
+        if ml_state.workflow_summary["evaluation_status"] == "failed":
+            raise Exception(f"Model evaluation failed: {ml_state.workflow_summary.get('error', 'Unknown error')}")
+
+        ml_state.workflow_summary["status"] = "completed successfully"
+        print(f"\nML Workflow {ml_state.workflow_summary['status']}!")
+
+    except Exception as e:
+        ml_state.workflow_summary["status"] = "failed"
+        ml_state.workflow_summary["error"] = str(e)
+        print(f"\nML Workflow {ml_state.workflow_summary['status']} with error: {e}")
+            
+    # Return the relevant parts of ml_state.workflow_summary for LangGraph to merge into AgentState
+    return {
+        "ml_state": ml_state.model_dump(),
+        "workflow_summary": ml_state.workflow_summary
+    }
